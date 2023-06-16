@@ -7,7 +7,7 @@ import bot
 
 app = FastAPI()
 
-app.include_router(bot.router, prefix="/wx")
+app.include_router(bot.router)
 
 if __name__ == "__main__":
     uvicorn.run(

@@ -5,7 +5,8 @@ import time
 import os
 
 from werobot import WeRoBot
-from fastapi import APIRouter
+from fastapi import APIRouter, status
+from fastapi.responses import PlainTextResponse
 from starlette.requests import Request
 from starlette.background import BackgroundTask
 import redis
@@ -20,12 +21,13 @@ wxbot.config["ENCODING_AES_KEY"] = os.getenv("wx_encode_key")
 
 MSG_LENGTH_LIMIT = 2000
 
-redis = redis.Redis(url=os.getenv("redis_url"))
+redis = redis.Redis(os.getenv("redis_url"))
 
 def ask_task(msgid, text):
     redis.hset(msgid, "question", text)
-    resp = ask.openai(msgid, text)
+    resp = ask.openai(text)
     redis.hset(msgid, "answer", resp)
+    return resp
 
 
 def query_answer(msgid, loop=5):
@@ -33,46 +35,113 @@ def query_answer(msgid, loop=5):
         if redis.hget(msgid, "answer"):
             return redis.hget(msgid, "answer")
         time.sleep(1)
+        loop -= 1
     return None
+
+def decode_value(val):
+    val= val.decode('utf-8')
+    if val.isdigit():
+        return int(val)
+    return val
+
+
+def query_user_info(openid: str):
+    data = redis.hgetall(openid)
+    return {key.decode('utf-8'): decode_value(value) for key, value in data.items()}
+
+def update_user_info(openid: str, userinfo: dict):
+    print(openid, userinfo)
+    redis.hmset(openid, userinfo)
+    redis.expire(openid, 86400)
+
+def prepare_answer():
+    pass
+
+wait_text_2 = "正在准备回答, 请耐心等待"
+wait_text = "正在思考，请耐心等待，稍后发送任意消息获取回复"
+wait_last_text = "正在准备上一个回答，请耐心等待"
+retry_text = "请求出错，请稍后重试"
+text_too_long = "文本太长"
 
 
 @wxbot.text
-def echo(message, session, background_tasks: BackgroundTask):
+def echo(message):
+    openid = message.source
     msgid = message.message_id
-    last_ok = session.get("last_ok", 0)
-    if session.get("last_msgid") == msgid:
-        if last_ok:
-            return ''
-        retry = session['retry'] + 1
-        resp = query_answer(msgid, loop=3 if retry == 3 else None)
-        if resp:
-            session['last_ok'] = 1
-            return resp
-        if retry == 3:
-            return "正在思考，请耐心等待，稍后发送任意消息获取回复"
-    else:
-        if not last_ok:
-            last_msgid = session.get("last_msgid", 0)
-            if last_msgid:
-                resp = query_answer(session.get("last_msgid"), loop=1)
-                if resp:
-                    session['last_ok'] = 1
-                    return resp
-                else:
-                    return "正在准备，稍后发送任意消息获取回复"
+    userinfo = query_user_info(openid) or {}
+    last_msgid = userinfo.get("last_msgid")
+    print(">>>>>>>>>>>>", msgid)
+    if redis.lock("lock:" + openid).locked(): #正在生成回答
+        print("11111111111")
+        if msgid != last_msgid:
+            return wait_last_text
         else:
-            msg = message.content
-            if len(msg) > MSG_LENGTH_LIMIT:
-                return "文本太长"
-            session['last_msgid'] = msgid
-            session['last_ok'] = 0
-            session['retry'] = 1
-            background_tasks.add_task(ask_task, msgid, message.content)
-            resp = query_answer(msgid)
+            userinfo["retry"] += 1
+            update_user_info(openid, userinfo)
+            retry = userinfo["retry"]
+            if retry < 3:
+                print("2222222222222")
+                resp = query_answer(msgid)
+                print("33333333333333")
+            else:
+                print(444444444444)
+                resp = query_answer(last_msgid, loop=2)
+                print(55555555555555)
             if resp:
-                session['last_ok'] = 1
+                userinfo["last_ok"] = 1
+                update_user_info(openid, userinfo)
+            else:
+                resp = wait_text
+            return resp
+
+    with redis.lock("lock:" + openid):
+        userinfo = query_user_info(openid) or {}
+        last_ok = userinfo.get("last_ok", 1)
+        print(msgid, last_ok, userinfo.get("last_msgid"))
+        if userinfo.get("last_msgid") == msgid:
+            if last_ok:
+                return query_answer(msgid)
+            retry = userinfo['retry'] + 1
+            resp = query_answer(msgid, loop=2 if retry == 3 else None)
+            if resp:
+                userinfo['last_ok'] = 1
+                update_user_info(openid, userinfo)
                 return resp
-            return "正在思考，请耐心等待，稍后发送任意消息获取回复"
+            if retry == 3:
+                return wait_text
+            else:
+                userinfo['retry'] = retry
+                update_user_info(openid, userinfo)
+                return wait_text
+        else:
+            if not last_ok:
+                last_msgid = userinfo.get("last_msgid", 0)
+                if last_msgid:
+                    resp = query_answer(userinfo.get("last_msgid"), loop=1)
+                    if resp:
+                        userinfo['last_ok'] = 1
+                        update_user_info(openid, userinfo)
+                        return resp
+                    else:
+                        return wait_text
+            msg = message.content
+            print(msg)
+            if len(msg) > MSG_LENGTH_LIMIT:
+                return text_too_long
+            userinfo['last_msgid'] = msgid
+            userinfo['last_ok'] = 0
+            userinfo['retry'] = 1
+            userinfo['working'] = 1
+            update_user_info(openid, userinfo)
+            resp = ask_task(msgid, message.content)
+            print(resp)
+            if resp:
+                userinfo = query_user_info(openid)
+                if userinfo['last_msgid'] == msgid and userinfo["retry"]==1:
+                    userinfo['last_ok'] = 1
+                    update_user_info(openid, userinfo)
+                return resp
+            return wait_text
 
 
 @wxbot.image
@@ -106,13 +175,12 @@ router = APIRouter()
 
 
 @router.get("/")
-def wechat_check(signature: str, timestamp: str, nonce: str, echostr: str):
+def wechat_check(signature: str=None, timestamp: str=None, nonce: str=None, echostr: str=None):
     '''
     微信接口检测
     '''
-
     if not signature or not timestamp or not nonce or not echostr:
-        return ""
+        return PlainTextResponse('', status_code=429)
     token = "9XjY2KmzF1LcNqo6v0Gt"
     check_list = [token, timestamp, nonce]
     check_list.sort()
@@ -120,23 +188,36 @@ def wechat_check(signature: str, timestamp: str, nonce: str, echostr: str):
     sha1 = hashlib.sha1(str1.encode())
     res = sha1.hexdigest()
     if res == signature:
-        return echostr
+        return PlainTextResponse(echostr)
     else:
-        return ""
+        return PlainTextResponse("")
 
 
 @router.post("/")
 async def hanler(request: Request):
-    body = await request.body().decode("utf-8")
+    body = (await request.body()).decode("utf-8")
     query_params = request.query_params
-    loop = asyncio.get_running_loop()
     func = partial(
         wxbot.parse_message,
         body=body,
-        timestamp=query_params.timestamp,
-        nonce=query_params.nonce,
-        msg_signature=query_params.msg_signature
+        timestamp=query_params.get("timestamp"),
+        nonce=query_params.get("nonce"),
+        msg_signature=query_params.get("msg_signature")
 
     )
-    message = await loop.run_in_executor(None, func)
-    return wxbot.get_encrypted_reply(message)
+    try:
+        message = wxbot.parse_message(
+            body=body,
+            timestamp=query_params.get("timestamp"),
+            nonce=query_params.get("nonce"),
+            msg_signature=query_params.get("msg_signature")
+        )
+        func = partial(
+            wxbot.get_encrypted_reply,
+            message
+        )
+        resp = await asyncio.wait_for(asyncio.to_thread(func), timeout=5)
+        return PlainTextResponse(resp, status_code=200)
+    except asyncio.TimeoutError:
+        print("Timeout!")
+        return PlainTextResponse(retry_text)

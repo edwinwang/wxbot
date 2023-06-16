@@ -4,7 +4,7 @@ import base64
 import requests
 from string import Template
 
-prompt_template = Template(base64.b64decode(os.getenv("prompt_template")).decode())
+prompt_template = Template(base64.b64decode(os.getenv("prompt_template_short")).decode())
 
 delimaters = (
   "####",
