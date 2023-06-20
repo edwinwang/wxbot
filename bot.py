@@ -3,6 +3,7 @@ import asyncio
 from functools import partial
 import time
 import os
+import logging
 
 from werobot import WeRoBot
 from fastapi import APIRouter, status
@@ -14,18 +15,19 @@ import redis
 import ask
 
 wxbot = WeRoBot(token=os.getenv("wx_token"))
-
 wxbot.config["APP_ID"] = os.getenv("wx_appid")
 wxbot.config["APP_SECRET"] = os.getenv("wx_appkey")
 wxbot.config["ENCODING_AES_KEY"] = os.getenv("wx_encode_key")
+
+logger = logging.getLogger(__name__)
 
 MSG_LENGTH_LIMIT = 2000
 
 redis = redis.Redis(os.getenv("redis_url"))
 
-def ask_task(msgid, text):
+def ask_task(openid, msgid, text):
     redis.hset(msgid, "question", text)
-    resp = ask.openai(text)
+    resp = ask.openai(openid, text)
     redis.hset(msgid, "answer", resp)
     return resp
 
@@ -50,7 +52,6 @@ def query_user_info(openid: str):
     return {key.decode('utf-8'): decode_value(value) for key, value in data.items()}
 
 def update_user_info(openid: str, userinfo: dict):
-    print(openid, userinfo)
     redis.hmset(openid, userinfo)
     redis.expire(openid, 86400)
 
@@ -70,9 +71,7 @@ def echo(message):
     msgid = message.message_id
     userinfo = query_user_info(openid) or {}
     last_msgid = userinfo.get("last_msgid")
-    print(">>>>>>>>>>>>", msgid)
     if redis.lock("lock:" + openid).locked(): #正在生成回答
-        print("11111111111")
         if msgid != last_msgid:
             return wait_last_text
         else:
@@ -80,13 +79,9 @@ def echo(message):
             update_user_info(openid, userinfo)
             retry = userinfo["retry"]
             if retry < 3:
-                print("2222222222222")
                 resp = query_answer(msgid)
-                print("33333333333333")
             else:
-                print(444444444444)
                 resp = query_answer(last_msgid, loop=2)
-                print(55555555555555)
             if resp:
                 userinfo["last_ok"] = 1
                 update_user_info(openid, userinfo)
@@ -97,7 +92,6 @@ def echo(message):
     with redis.lock("lock:" + openid):
         userinfo = query_user_info(openid) or {}
         last_ok = userinfo.get("last_ok", 1)
-        print(msgid, last_ok, userinfo.get("last_msgid"))
         if userinfo.get("last_msgid") == msgid:
             if last_ok:
                 return query_answer(msgid)
@@ -125,7 +119,6 @@ def echo(message):
                     else:
                         return wait_text
             msg = message.content
-            print(msg)
             if len(msg) > MSG_LENGTH_LIMIT:
                 return text_too_long
             userinfo['last_msgid'] = msgid
@@ -133,8 +126,7 @@ def echo(message):
             userinfo['retry'] = 1
             userinfo['working'] = 1
             update_user_info(openid, userinfo)
-            resp = ask_task(msgid, message.content)
-            print(resp)
+            resp = ask_task(openid, msgid, message.content)
             if resp:
                 userinfo = query_user_info(openid)
                 if userinfo['last_msgid'] == msgid and userinfo["retry"]==1:

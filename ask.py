@@ -27,12 +27,14 @@ def prompt(text):
     return prompt_template.substitute(delimater=delimater, content=text)
 
 
-def openai(text):
+def openai(openid, text):
     resp = requests.post(
         url=os.getenv("chat_url"),
         json={
             "content": prompt(text),
-            "model": "text-davinci-002-render-sha-mobile"
+            "model": "text-davinci-002-render-sha-mobile",
+            "openid": openid,
+            "new_chat": False
         },
         headers={
             "Authorization": f"Bearer {CHAT_TOKEN}",
