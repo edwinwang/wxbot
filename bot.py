@@ -6,6 +6,7 @@ import os
 import logging
 
 from werobot import WeRoBot
+from werobot.messages.messages import TextMessage, VoiceMessage
 from fastapi import APIRouter, status
 from fastapi.responses import PlainTextResponse
 from starlette.requests import Request
@@ -22,14 +23,24 @@ wxbot.config["ENCODING_AES_KEY"] = os.getenv("wx_encode_key")
 logger = logging.getLogger(__name__)
 
 MSG_LENGTH_LIMIT = 2000
+wait_text_2 = "正在准备回答, 请耐心等待"
+wait_text = "正在思考，请耐心等待，稍后发送任意消息获取回复"
+wait_last_text = "正在准备上一个回答，请耐心等待"
+retry_text = "请求出错，请稍后重试"
+text_too_long = "文本太长"
 
 redis = redis.Redis(os.getenv("redis_url"))
 
 def ask_task(openid, msgid, text):
-    redis.hset(msgid, "question", text)
-    resp = ask.openai(openid, text)
-    redis.hset(msgid, "answer", resp)
-    return resp
+    try:
+        redis.hset(msgid, "question", text)
+        redis.expire(msgid, 86400*2)
+        resp = ask.openai(openid, text)
+        redis.hset(msgid, "answer", resp)
+        return resp
+    except Exception as e:
+        print(e)
+        redis.delete(msgid)
 
 
 def query_answer(msgid, loop=5):
@@ -58,14 +69,19 @@ def update_user_info(openid: str, userinfo: dict):
 def prepare_answer():
     pass
 
-wait_text_2 = "正在准备回答, 请耐心等待"
-wait_text = "正在思考，请耐心等待，稍后发送任意消息获取回复"
-wait_last_text = "正在准备上一个回答，请耐心等待"
-retry_text = "请求出错，请稍后重试"
-text_too_long = "文本太长"
+def last_asked(msgid):
+    return bool(redis.hget(msgid, 'question'))
 
+
+def get_content(message):
+    if isinstance(message, TextMessage):
+        return message.content
+    elif isinstance(message, VoiceMessage):
+        return message.recognition
+    return ""
 
 @wxbot.text
+@wxbot.voice
 def echo(message):
     openid = message.source
     msgid = message.message_id
@@ -92,7 +108,8 @@ def echo(message):
     with redis.lock("lock:" + openid):
         userinfo = query_user_info(openid) or {}
         last_ok = userinfo.get("last_ok", 1)
-        if userinfo.get("last_msgid") == msgid:
+        last_msgid = userinfo.get("last_msgid", 0)
+        if last_msgid == msgid:
             if last_ok:
                 return query_answer(msgid)
             retry = userinfo['retry'] + 1
@@ -108,25 +125,27 @@ def echo(message):
                 update_user_info(openid, userinfo)
                 return wait_text
         else:
-            if not last_ok:
-                last_msgid = userinfo.get("last_msgid", 0)
-                if last_msgid:
-                    resp = query_answer(userinfo.get("last_msgid"), loop=1)
-                    if resp:
-                        userinfo['last_ok'] = 1
-                        update_user_info(openid, userinfo)
-                        return resp
-                    else:
+            if not last_ok and last_asked(last_msgid):
+                resp = query_answer(userinfo.get("last_msgid"), loop=1)
+                if resp:
+                    userinfo['last_ok'] = 1
+                    update_user_info(openid, userinfo)
+                    return resp
+                else:
+                    if time.time()-userinfo.get('ask_time', 0) < 150:
                         return wait_text
-            msg = message.content
+            msg = get_content(message) 
+            if not msg:
+                return ''
             if len(msg) > MSG_LENGTH_LIMIT:
                 return text_too_long
             userinfo['last_msgid'] = msgid
             userinfo['last_ok'] = 0
             userinfo['retry'] = 1
             userinfo['working'] = 1
+            userinfo['ask_time'] = int(time.time())
             update_user_info(openid, userinfo)
-            resp = ask_task(openid, msgid, message.content)
+            resp = ask_task(openid, msgid, msg)
             if resp:
                 userinfo = query_user_info(openid)
                 if userinfo['last_msgid'] == msgid and userinfo["retry"]==1:
@@ -140,8 +159,7 @@ def echo(message):
 def image(message):
     return message.img
 
-
-@wxbot.voice
+#@wxbot.voice
 def voice(message):
     return message.recognition
 
