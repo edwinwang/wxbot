@@ -32,7 +32,7 @@ def openai(openid, text):
         url=os.getenv("chat_url"),
         json={
             "content": prompt(text),
-            "model": "text-davinci-002-render-sha-mobile",
+            "model": "text-davinci-002-render-sha",
             "openid": openid,
             "new_chat": False
         },
